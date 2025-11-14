@@ -1,0 +1,11 @@
+version: '3'
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    ports:
+      - "5678:5678"
+    environment:
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+    volumes:
+      - ./n8n_data:/home/node/.n8n
