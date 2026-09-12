@@ -1,0 +1,8 @@
+manifest_version: 1
+name: atlas-github-secret-writer
+version: 1.0.0
+description: Guarded Atlas GitHub Environment secret writer for WordPress SSH deploy automation
+author: Atlas
+provides_tools:
+  - atlas_github_secret_writer
+provides_hooks: []
