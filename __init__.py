@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import base64
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 DEFAULT_REPO = "krakendigitex-hub/suppspro-portal"
 DEFAULT_ENVIRONMENT = "production"
 DEFAULT_ALLOWLIST = {"WP_SSH_PRIVATE_KEY"}
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_API_VERSION = "2022-11-28"
 
 
 def _allowlist() -> set[str]:
@@ -19,42 +25,119 @@ def _allowlist() -> set[str]:
     return vals or set(DEFAULT_ALLOWLIST)
 
 
+def _token() -> str:
+    return (os.environ.get("HERMES_GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+
+
+def _pynacl_available() -> bool:
+    return importlib.util.find_spec("nacl.public") is not None
+
+
 def _safe_config() -> dict[str, Any]:
-    token = (os.environ.get("HERMES_GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
     return {
-        "token_configured": bool(token),
+        "token_configured": bool(_token()),
         "repo": os.environ.get("HERMES_GITHUB_REPO", DEFAULT_REPO),
         "environment": os.environ.get("HERMES_GITHUB_ENVIRONMENT", DEFAULT_ENVIRONMENT),
         "allowed_secrets": sorted(_allowlist()),
         "gh_available": bool(shutil.which("gh")),
+        "github_rest_available": True,
+        "pynacl_available": _pynacl_available(),
         "ssh_keygen_available": bool(shutil.which("ssh-keygen")),
     }
 
 
-def _gh_env() -> dict[str, str]:
-    token = (os.environ.get("HERMES_GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
-    env = os.environ.copy()
-    if token:
-        env["GH_TOKEN"] = token
-    env.pop("GITHUB_TOKEN", None)
-    return env
+def _github_api_request(method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any] | None]:
+    token = _token()
+    if not token:
+        raise RuntimeError("github_token_not_configured")
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{GITHUB_API_BASE}/{path.lstrip('/')}",
+        data=data,
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            "User-Agent": "atlas-hermes-github-secret-writer",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read()
+            body = json.loads(raw.decode("utf-8")) if raw else None
+            return response.status, body
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+
+
+def _get_public_key(repo: str, environment: str) -> tuple[bool, str | None, dict[str, str] | None]:
+    if not _token():
+        return False, "github_token_not_configured", None
+
+    try:
+        status, body = _github_api_request(
+            "GET",
+            f"repos/{repo}/environments/{environment}/secrets/public-key",
+        )
+    except Exception:
+        return False, "github_api_transport_error", None
+
+    if status != 200 or not isinstance(body, dict):
+        return False, f"github_api_failed_{status}", None
+
+    key_id = body.get("key_id")
+    key = body.get("key")
+    if not isinstance(key_id, str) or not isinstance(key, str) or not key_id or not key:
+        return False, "github_public_key_invalid", None
+
+    return True, None, {"key_id": key_id, "key": key}
 
 
 def _probe_github(repo: str, environment: str):
-    if not shutil.which("gh"):
-        return False, "gh_not_available"
-    if not _safe_config()["token_configured"]:
-        return False, "github_token_not_configured"
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/environments/{environment}/secrets/public-key", "--silent"],
-        env=_gh_env(),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    return (True, None) if result.returncode == 0 else (False, f"gh_api_failed_{result.returncode}")
+    ok, err, _ = _get_public_key(repo, environment)
+    return ok, err
+
+
+def _encrypt_secret(public_key_b64: str, value: str) -> str:
+    from nacl import public
+
+    public_key = public.PublicKey(base64.b64decode(public_key_b64))
+    sealed_box = public.SealedBox(public_key)
+    encrypted = sealed_box.encrypt(value.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def _set_environment_secret(repo: str, environment: str, name: str, value: str) -> tuple[bool, str | None]:
+    if not _pynacl_available():
+        return False, "pynacl_not_available"
+
+    ok, err, key_data = _get_public_key(repo, environment)
+    if not ok or key_data is None:
+        return False, err or "github_public_key_unavailable"
+
+    try:
+        encrypted_value = _encrypt_secret(key_data["key"], value)
+        status, _ = _github_api_request(
+            "PUT",
+            f"repos/{repo}/environments/{environment}/secrets/{name}",
+            {
+                "encrypted_value": encrypted_value,
+                "key_id": key_data["key_id"],
+            },
+        )
+    except Exception:
+        return False, "github_secret_write_transport_error"
+
+    if status not in (201, 204):
+        return False, f"github_secret_write_failed_{status}"
+    return True, None
 
 
 def _fingerprint(path: Path) -> str:
@@ -72,13 +155,15 @@ def _fingerprint(path: Path) -> str:
 
 def _rotate_wp_ssh_key(repo: str, environment: str) -> dict[str, Any]:
     name = "WP_SSH_PRIVATE_KEY"
+    cfg = _safe_config()
+
     if name not in _allowlist():
         return {"ok": False, "error": "secret_name_not_allowed", "secret_name": name}
-    if not _safe_config()["token_configured"]:
+    if not cfg["token_configured"]:
         return {"ok": False, "error": "github_token_not_configured"}
-    if not shutil.which("gh"):
-        return {"ok": False, "error": "gh_not_available"}
-    if not shutil.which("ssh-keygen"):
+    if not cfg["pynacl_available"]:
+        return {"ok": False, "error": "pynacl_not_available"}
+    if not cfg["ssh_keygen_available"]:
         return {"ok": False, "error": "ssh_keygen_not_available"}
 
     ok, err = _probe_github(repo, environment)
@@ -99,24 +184,17 @@ def _rotate_wp_ssh_key(repo: str, environment: str) -> dict[str, Any]:
         private_key = key.read_text(encoding="utf-8")
         public_key = public.read_text(encoding="utf-8").strip()
         fingerprint = _fingerprint(public)
-        result = subprocess.run(
-            ["gh", "secret", "set", name, "--env", environment, "--repo", repo],
-            input=private_key,
-            env=_gh_env(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+
+        written, write_error = _set_environment_secret(repo, environment, name, private_key)
         private_key = ""
-        if result.returncode != 0:
+        if not written:
             return {
                 "ok": False,
-                "error": f"gh_secret_set_failed_{result.returncode}",
+                "error": write_error or "github_secret_write_failed",
                 "secret_name": name,
                 "secret_value_exposed": False,
             }
+
         return {
             "ok": True,
             "status": "completed",
@@ -132,7 +210,6 @@ def _rotate_wp_ssh_key(repo: str, environment: str) -> dict[str, Any]:
 
 
 def atlas_github_secret_writer(params: Any = None, **kwargs: Any) -> str:
-    """Hermes tool handler. Runtime metadata such as task_id is accepted and ignored safely."""
     del kwargs
     if params is None:
         operation = "status"
@@ -150,14 +227,22 @@ def atlas_github_secret_writer(params: Any = None, **kwargs: Any) -> str:
     if operation == "status":
         access = False
         err = None
-        if cfg["token_configured"] and cfg["gh_available"]:
+        if cfg["token_configured"]:
             access, err = _probe_github(repo, environment)
+        writer_ready = bool(
+            cfg["token_configured"]
+            and cfg["github_rest_available"]
+            and cfg["pynacl_available"]
+            and cfg["ssh_keygen_available"]
+            and access
+        )
         return json.dumps(
             {
                 "ok": True,
                 "service": "atlas-hermes-github-secret-writer",
                 **cfg,
                 "github_access": access,
+                "writer_ready": writer_ready,
                 "probe_error": err,
                 "secret_values_exposed": False,
             },
@@ -186,7 +271,7 @@ def atlas_github_secret_writer(params: Any = None, **kwargs: Any) -> str:
 
 ATLAS_GITHUB_SECRET_WRITER_SCHEMA = {
     "name": "atlas_github_secret_writer",
-    "description": "Atlas guarded GitHub Environment secret writer. status verifies readiness. rotate_wp_ssh_key generates a fresh Ed25519 key, stores only the PRIVATE key directly in GitHub Environment secret WP_SSH_PRIVATE_KEY, and returns only the PUBLIC key/fingerprint for Hostinger authorization. Never exposes the GitHub token or private key.",
+    "description": "Atlas guarded GitHub Environment secret writer. status verifies readiness. rotate_wp_ssh_key generates a fresh Ed25519 key, encrypts the private key with GitHub's public key, stores only the PRIVATE key in GitHub Environment secret WP_SSH_PRIVATE_KEY, and returns only the PUBLIC key/fingerprint for Hostinger authorization. Never exposes the GitHub token or private key.",
     "parameters": {
         "type": "object",
         "properties": {
