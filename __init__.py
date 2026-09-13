@@ -1,5 +1,10 @@
 from __future__ import annotations
-import json, os, shutil, subprocess, tempfile
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +45,7 @@ def _probe_github(repo: str, environment: str):
         return False, "gh_not_available"
     if not _safe_config()["token_configured"]:
         return False, "github_token_not_configured"
-    r = subprocess.run(
+    result = subprocess.run(
         ["gh", "api", f"repos/{repo}/environments/{environment}/secrets/public-key", "--silent"],
         env=_gh_env(),
         stdout=subprocess.DEVNULL,
@@ -49,19 +54,19 @@ def _probe_github(repo: str, environment: str):
         timeout=20,
         check=False,
     )
-    return (True, None) if r.returncode == 0 else (False, f"gh_api_failed_{r.returncode}")
+    return (True, None) if result.returncode == 0 else (False, f"gh_api_failed_{result.returncode}")
 
 
-def _fingerprint(p: Path) -> str:
-    r = subprocess.run(
-        ["ssh-keygen", "-lf", str(p)],
+def _fingerprint(path: Path) -> str:
+    result = subprocess.run(
+        ["ssh-keygen", "-lf", str(path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
         timeout=10,
         check=True,
     )
-    parts = r.stdout.strip().split()
+    parts = result.stdout.strip().split()
     return parts[1] if len(parts) >= 2 else "unknown"
 
 
@@ -82,7 +87,7 @@ def _rotate_wp_ssh_key(repo: str, environment: str) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="atlas-hermes-key-") as tmp:
         key = Path(tmp) / "id_ed25519"
-        pub = Path(str(key) + ".pub")
+        public = Path(str(key) + ".pub")
         subprocess.run(
             ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "atlas-hermes-wordpress-deploy", "-f", str(key)],
             stdout=subprocess.DEVNULL,
@@ -92,9 +97,9 @@ def _rotate_wp_ssh_key(repo: str, environment: str) -> dict[str, Any]:
             check=True,
         )
         private_key = key.read_text(encoding="utf-8")
-        public_key = pub.read_text(encoding="utf-8").strip()
-        fp = _fingerprint(pub)
-        r = subprocess.run(
+        public_key = public.read_text(encoding="utf-8").strip()
+        fingerprint = _fingerprint(public)
+        result = subprocess.run(
             ["gh", "secret", "set", name, "--env", environment, "--repo", repo],
             input=private_key,
             env=_gh_env(),
@@ -105,10 +110,10 @@ def _rotate_wp_ssh_key(repo: str, environment: str) -> dict[str, Any]:
             check=False,
         )
         private_key = ""
-        if r.returncode != 0:
+        if result.returncode != 0:
             return {
                 "ok": False,
-                "error": f"gh_secret_set_failed_{r.returncode}",
+                "error": f"gh_secret_set_failed_{result.returncode}",
                 "secret_name": name,
                 "secret_value_exposed": False,
             }
@@ -121,28 +126,44 @@ def _rotate_wp_ssh_key(repo: str, environment: str) -> dict[str, Any]:
             "secret_name": name,
             "secret_value_exposed": False,
             "public_key": public_key,
-            "public_key_fingerprint": fp,
+            "public_key_fingerprint": fingerprint,
             "next_action": "Authorize this public key for the WordPress SSH user in Hostinger, then rerun the WordPress deploy.",
         }
 
 
-def atlas_github_secret_writer(operation: str = "status") -> str:
+def atlas_github_secret_writer(params: Any = None, **kwargs: Any) -> str:
+    """Hermes tool handler. Runtime metadata such as task_id is accepted and ignored safely."""
+    del kwargs
+    if params is None:
+        operation = "status"
+    elif isinstance(params, dict):
+        operation = params.get("operation", "status")
+    elif isinstance(params, str):
+        operation = params
+    else:
+        return json.dumps({"ok": False, "error": "invalid_arguments"}, sort_keys=True)
+
     cfg = _safe_config()
     repo = cfg["repo"]
     environment = cfg["environment"]
+
     if operation == "status":
         access = False
         err = None
         if cfg["token_configured"] and cfg["gh_available"]:
             access, err = _probe_github(repo, environment)
-        return json.dumps({
-            "ok": True,
-            "service": "atlas-hermes-github-secret-writer",
-            **cfg,
-            "github_access": access,
-            "probe_error": err,
-            "secret_values_exposed": False,
-        }, sort_keys=True)
+        return json.dumps(
+            {
+                "ok": True,
+                "service": "atlas-hermes-github-secret-writer",
+                **cfg,
+                "github_access": access,
+                "probe_error": err,
+                "secret_values_exposed": False,
+            },
+            sort_keys=True,
+        )
+
     if operation == "rotate_wp_ssh_key":
         try:
             return json.dumps(_rotate_wp_ssh_key(repo, environment), sort_keys=True)
@@ -152,11 +173,15 @@ def atlas_github_secret_writer(operation: str = "status") -> str:
             return json.dumps({"ok": False, "error": "ssh_key_generation_failed"})
         except Exception:
             return json.dumps({"ok": False, "error": "unexpected_writer_error"})
-    return json.dumps({
-        "ok": False,
-        "error": "unsupported_operation",
-        "allowed_operations": ["status", "rotate_wp_ssh_key"],
-    }, sort_keys=True)
+
+    return json.dumps(
+        {
+            "ok": False,
+            "error": "unsupported_operation",
+            "allowed_operations": ["status", "rotate_wp_ssh_key"],
+        },
+        sort_keys=True,
+    )
 
 
 ATLAS_GITHUB_SECRET_WRITER_SCHEMA = {
